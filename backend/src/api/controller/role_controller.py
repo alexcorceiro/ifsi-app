@@ -1,20 +1,30 @@
 from typing import List, Optional, Tuple, Dict, Any
 from database.connection import get_db_connection, release_db_connection
 
-def list_roles() -> List[Dict[str, Any]]:
+def list_roles(limit: int = 50, offset: int = 0, q: Optional[str] = None) -> Tuple[List[Tuple], int]:
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute("""
-            SELECT id, code, label, description
-            FROM roles
-            ORDER BY code;
-        """)
+        if q:
+            where = "WHERE code ILIKE %s OR label ILIKE %s"
+            params = (f"%{q}%", f"%{q}%")
+        else:
+            where = ""
+            params = ()
+
+        cur.execute(f"SELECT COUNT(*) FROM roles {where};", params)
+        total = cur.fetchone()[0]
+
+        cur.execute(
+            f"""SELECT id, code, label, description, created_at, updated_at
+                FROM roles
+                {where}
+                ORDER BY code
+                LIMIT %s OFFSET %s;""",
+            (*params, limit, offset) if params else (limit, offset),
+        )
         rows = cur.fetchall()
-        return [
-            {"id": r[0], "code": r[1], "label": r[2], "description": r[3]}
-            for r in rows
-        ]
+        return rows, total
     finally:
         cur.close()
         conn.close()
@@ -24,13 +34,14 @@ def get_role_by_id(role_id: int) -> Optional[Tuple]:
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT id, code, lable, description, created_at, updated_at
-            FROM roles WHERE id = %s
-        """, (role_id))
+            SELECT r.id, r.code, r.label, r.description, r.created_at, r.updated_at
+            FROM public.roles AS r
+            WHERE r.id = %s
+        """, (role_id,))  # attention à la virgule !
         return cur.fetchone()
     finally:
         cur.close()
-        release_db_connection(conn)
+        conn.close()
 
 def get_role_by_code(code: str) -> Optional[Tuple]:
     conn = get_db_connection()

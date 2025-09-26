@@ -1,43 +1,79 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
+from argon2 import PasswordHasher
 from utils.password import hash_password, verify_password
-from utils.jwt import create_access_token, verify_access_token
+from utils.jwt import create_access_token, verify_access_token, create_refresh_token , hash_token
 from api.controller import auth_controller, user_controller
 from utils.crypto import sha256_hex
+from schema.auth import RegisterIn, LoginIn , UserOut, TokensOut, AuthOut
+from fastapi import HTTPException
+
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 60  
 
+ph=PasswordHasher()
 
-def register(email: str, password: str, first_name: str = "", last_name: str = "") -> Dict[str, Any]:
-    existing = auth_controller.find_user_by_email(email)
+def register(payload: RegisterIn) -> UserOut:
+    
+    existing = auth_controller.find_user_by_email(payload.email)
     if existing:
-        raise ValueError("Email deja utilise")
-    pw_hash = hash_password(password)
-    user_id = auth_controller.insert_user(email, pw_hash, first_name, last_name)
-    return {"user_id": user_id, "message": "Utilisateur cree"}
+        raise ValueError("Email déjà utilisé")
 
+    password_hash = hash_password(payload.password)
 
-def login(email: str, password: str) -> Dict[str, Any]:
-    user = auth_controller.find_user_by_email(email)
-    if not user:
-        raise ValueError("Identifiants invalides")
-    uid, uemail, pw_hash, is_active = user
-    if not is_active:
-        raise ValueError("Compte desactive")
-    if not verify_password(password, pw_hash):
-        raise ValueError("Identifiants invalides")
+    data = payload.model_dump()
+    data["password_hash"] = password_hash
+    data.pop("password")   
 
-    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token = create_access_token({"sub": uemail, "user_id": uid}, expires_delta=expires)
+    user = auth_controller.insert_user(data)
 
-    payload = verify_access_token(token) or {}
-    exp_ts = payload.get("exp") if payload else None
-    exp_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc) if exp_ts else None
-    auth_controller.add_session(uid, sha256_hex(token), exp_dt)
+    return UserOut(
+        id=user["id"],
+        email=user["email"],
+        first_name=user.get("first_name"),
+        last_name=user.get("last_name"),
+        pseudo=user.get("pseudo"),
+        phone_number=user.get("phone_number"),
+        city=user.get("city"),
+        country=user.get("country"),
+        is_active=user.get("is_active"),
+        created_at=user.get("created_at"),
+    )
 
-    return {"access_token": token, "token_type": "Bearer", "expires_in_minutes": ACCESS_TOKEN_EXPIRE_MINUTES}
+def login(payload: LoginIn) -> AuthOut: 
+   u = user_controller.get_user_by_email(payload.email)
+   if not u or not u["is_active"]:
+       raise HTTPException(status_code=400, detail="Identifiants invalides")
+   
+   try: 
+       ph.verify(u["password_hash"], payload.password)
+   except Exception:
+       raise HTTPException(status_code=400, detail="Identifiants invalides")
+   
+   access = create_access_token({"user_id": u["id"], "email": u["email"]})
+   refresh = create_refresh_token({"user_id": u["id"]}, days=15)
 
+   exp = datetime.now(timezone.utc) + timedelta(days=15)
+   sid = auth_controller.add_session(u["id"], sha256_hex(refresh), exp)
+
+   if not sid :
+       raise HTTPException(status_code=500, detail="Impossible de cree une session")
+   
+   print(f"[LOGIN] OK: session_id={sid}, user_id={u['id']}")
+   
+   user = UserOut(
+                id=u["id"], email=u["email"], first_name=u["first_name"],
+                last_name=u["last_name"], pseudo=u["pseudo"], is_active=u["is_active"]
+            )
+
+   return AuthOut(
+        user=user,
+        tokens=TokensOut(
+            access_token=access,
+            refresh_token=refresh
+        )
+    )
 
 def logout(token: str) -> Dict[str, str]:
     sess = auth_controller.get_session_by_token(token)
@@ -51,12 +87,41 @@ def get_user_connected(token: str) -> Dict[str, Any]:
     payload = verify_access_token(token)
     if not payload:
         raise ValueError("Token invalide ou expire")
-    # Vérifie que la session existe toujours (non révoquée)
-    if not auth_controller.get_session_by_token(sha256_hex(token)):
-        raise ValueError("Session expiree ou deconnectee")
-
     uid = int(payload["user_id"])
-    row = user_controller.get_user_by_id(uid)
-    if not row:
+
+    sess = auth_controller.get_active_session_by_user_id(uid)
+    if not sess : 
+        raise ValueError("Session expiree ou deconnectee")
+    
+    user = user_controller.get_roles_by_user_id(uid)
+    if not user:
         raise ValueError("Utilisateur introuvable")
-    return {"id": row[0], "email": row[1], "first_name": row[2], "last_name": row[3], "is_active": row[4]}
+    
+    return{
+        "id": user["id"],
+        "email": user["email"],
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "pseudo": user.get("pseudo"),
+        "is_active": user["is_active"],
+        "created_at": user.get("created_at"),
+    }
+
+def me_from_access_token(access_token: str) -> Dict[str, Any]:
+    payload = verify_access_token(access_token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Token invalide ou expiré")
+
+    uid = payload.get("user_id")
+    if uid is None:
+        raise HTTPException(status_code=401, detail="Token incomplet")
+
+    me = auth_controller.fetch_me_if_session_active(int(uid))
+    if not me:
+        raise HTTPException(status_code=401, detail="Session expirée ou déconnectée")
+
+    return me
+
+
+
+

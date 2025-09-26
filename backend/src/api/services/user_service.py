@@ -24,23 +24,22 @@ def get_all_users(limit = 100, offset: int = 0) -> List[Dict[str, Any]]:
     users = [_row_to_user(r) for r in rows]
     return users[offset: offset + limit]
 
-def _norm(items: Iterable[str]) -> set[str]:
-    return {str(x).strip().lower() for x in(items or []) if x}
+def has_any_role(user_id: int, roles: List[str]) -> bool:
+    # si tu as déjà une fonction get_roles_by_user_id, sinon à implémenter
+    from api.controller import role_controller
+    user_roles = set(role_controller.get_roles_codes_by_user_id(user_id) or [])
+    return any(r in user_roles for r in roles)
 
+def has_all_roles(user_id: int, required_roles: List[str]) -> bool:
+    if not required_roles:
+        return True
+    user_roles = set(user_controller.get_roles_by_user_id(user_id) or [])
+    return set(required_roles).issubset(user_roles)
 
-def has_any_role(user_id: int, roles: list[str]) -> bool:
-    need = _norm(roles)
-    have = set(user_controller.get_roles_by_user_id(user_id) or [])
-    ok = bool(have.intersection(need))
-    print(f"[RBAC-ROLES] uid={user_id} needAny={sorted(need)} have={sorted(have)} -> {ok}")
-    return ok
-
-def has_permissions(user_id: int, req_perms: list[str]) -> bool:
-    need = _norm(req_perms)
-    have = set(user_controller.get_permissions_by_user_id(user_id) or [])
-    ok = need.issubset(have)
-    print(f"[RBAC-PERMS] uid={user_id} need={sorted(need)} have={sorted(have)} -> {ok}")
-    return ok
+def has_permissions(user_id: int, required: List[str]) -> bool:
+    """Vérifie que l’utilisateur possède TOUTES les permissions demandées."""
+    user_perms = set(user_controller.get_permissions_by_user_id(user_id) or [])
+    return all(p in user_perms for p in required)
     
 
 def update_user(user_id: int, first_name: str, last_name: str) -> Dict[str, str]:

@@ -1,24 +1,15 @@
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, status
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional
 from api.services import auth_service
-from utils.jwt import verify_access_token
-from slowapi.util import get_remote_address
+from utils.auth import extract_bearer
 from slowapi import Limiter
 from fastapi import Request, Depends
+from schema.auth import LoginIn, RegisterIn, UserOut
+
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-class RegisterIn(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=8)
-    first_name: Optional[str] = ""
-    last_name: Optional[str] = ""
-
-class LoginIn(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=1)
 
 def limiter_dep(request:Request) -> Limiter:
     return request.app.state.limiter
@@ -29,37 +20,23 @@ def _extract_bearer(authorization: Optional[str]) -> str:
         raise HTTPException(status_code=401, detail="Token invalide")
     return authorization.split(" ", 1)[1]
 
-@router.post("/register")
+@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterIn):
     try:
-        return auth_service.register(
-            email=payload.email,
-            password=payload.password,
-            first_name=payload.first_name or "",
-            last_name=payload.last_name or "",
-        )
+        user = auth_service.register(payload) 
+        return user
     except ValueError as e:
-        # Erreur métier lisible
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        # Ne JAMAIS renvoyer str(e) ici (risque encodage)
-        raise HTTPException(status_code=400, detail="Erreur")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Erreur d'inscription")
 
 @router.post("/login")
 def login(payload: LoginIn):
-    try:
-        return auth_service.login(payload.email, payload.password)
-    except ValueError as e:
-        # erreurs metier (identifiants invalides, compte désactivé, etc.)
-        raise HTTPException(status_code=401, detail=str(e))
-    except Exception as e:
-        # ✅ on CAPTURE l'exception pour pouvoir la logguer
-        print("[LOGIN-ERROR]", repr(e))
-        raise HTTPException(status_code=400, detail="Erreur")
+    return auth_service.login(payload)
 
 @router.post("/logout")
 def logout(authorization: Optional[str] = Header(default=None)):
-    token = _extract_bearer(authorization)
+    token = extract_bearer(authorization)
     try:
         return auth_service.logout(token)
     except Exception:
@@ -67,10 +44,10 @@ def logout(authorization: Optional[str] = Header(default=None)):
 
 @router.get("/me")
 def me(authorization: Optional[str] = Header(default=None)):
-    token = _extract_bearer(authorization)
     try:
-        return auth_service.get_user_connected(token)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        token = extract_bearer(authorization)
+        return auth_service.me_from_access_token(token)
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=400, detail="Erreur")

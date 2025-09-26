@@ -1,15 +1,18 @@
 from database.connection import get_db_connection
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 
-def get_user_by_id(user_id: int) -> Optional[Tuple]:
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT id, email, first_name , last_name, is_active
-            FROM users WHERE id = %s
-        """,(user_id, ))
-        return cur.fetchone()
+            SELECT id, email, first_name, last_name, pseudo, is_active
+            FROM public.users
+            WHERE id = %s;
+        """, (user_id,))
+        r = cur.fetchone()
+        if not r: return None
+        return { "id": r[0], "email": r[1], "first_name": r[2], "last_name": r[3], "pseudo": r[4], "is_active": r[5] }
     finally:
         cur.close()
         conn.close()
@@ -27,33 +30,62 @@ def get_all_users():
         cur.close()
         conn.close()
 
-
-def get_roles_by_user_id(user_id: int) -> list[str]:
-    conn = get_db_connection(); 
+def get_user_by_email(email: str) -> dict | None: 
+    conn = get_db_connection()
     cur = conn.cursor()
-    try:
+    try: 
         cur.execute("""
-            SELECT r.code
-            FROM user_roles ur
-            JOIN roles r ON r.id = ur.role_id
-            WHERE ur.user_id = %s;
-        """, (user_id,))
-        return [row[0] for row in cur.fetchall()]
+            SELECT id, email, password_hash, first_name, last_name, pseudo,
+                    phone_number, address_line1, address_line2, postal_code,
+                    city, country, date_of_birth, profile_picture_url,
+                    is_active, created_at
+            FROM users
+            WHERE email = %s
+        """,(email,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        
+        cols = [desc[0] for desc in cur.description ]
+        return dict(zip(cols, row))
     finally:
         cur.close()
         conn.close()
 
-def get_premissions_by_user_id(user_id: int) -> list[str]:
+def get_roles_by_user_id(user_id: int) -> List[str]:
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-            cur.execute("""
+        cur.execute("""
+            SELECT DISTINCT r.code
+            FROM user_roles ur
+            JOIN roles r ON r.id = ur.role_id
+            WHERE ur.user_id = %s;
+        """, (user_id,))
+        rows = cur.fetchall() or []
+        return [r[0] for r in rows]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_permissions_by_user_id(user_id: int) -> List[str]:
+ 
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
             SELECT DISTINCT p.code
             FROM user_roles ur
             JOIN role_permissions rp ON rp.role_id = ur.role_id
-            JOIN permissions p ON p.id = rp.permission_id
+            JOIN permissions p       ON p.id = rp.permission_id
             WHERE ur.user_id = %s;
-        """, (user_id,))
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall() or []
+        return [r[0] for r in rows]
     finally:
         cur.close()
         conn.close()
