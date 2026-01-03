@@ -1,171 +1,177 @@
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List
 from database.connection import get_db_connection
 
-def _row_to_dict(cur, row) -> Dict:
-    cols = [d[0] for d in cur.description]
-    return dict(zip(cols, row))
-
-def get_by_id(pid: int) -> Optional[Dict]:
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try: 
-        cur.execute("""
-            SELECT id, code, title, summary, category_id, tags, is_published, created_by, created_at, updated_at
-                    FROM content.protocols
-                    WHERE id = %s ;
-        """,(pid,))
-        row = cur.fetchone()
-        return _row_to_dict(cur, row) if row else None
-    finally:
-        cur.close()
-        conn.close()
-
-def get_by_code(code: str) -> Optional[Dict]:
-    conn= get_db_connection()
-    cur = conn.cursor()
-    try: 
-        cur.execute("""
-            SELECT id, code, title, summary, category_id, tags, is_published, created_by, updated_at
-                    FROM content.protocols
-                    WHERE lower(code) = lower(%s);
-        """,(code.strip(),))
-        row = cur.fetchone()
-        return _row_to_dict(cur, row) if row else None
-    finally:
-        cur.close()
-        conn.close()
-
-def get_latest_version(protocol_id: int) -> Optional[Dict]:
+def create_protocol(category_id: Optional[int], code: str, title: str, summary: Optional[str],
+                    tags: list, is_published: bool, external_url: Optional[str] ):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        cur.execute("SELECT 1 FROM content.protocols WHERE code=%s", (code,))
+        if cur.fetchone():
+            raise ValueError("CODE_ALREADY_EXISTS")
         cur.execute("""
-            SELECR id, version, body_md, changelog, published_at, created_at
-                    FROM content.protocol_versions
-                    WHERE protocol_id = %s
-                    ORDER BY COALESCE(published_at, created_at) DESC , version DESC
-                    LIMIT 1;
-        """,(protocol_id,))
+            INSERT INTO content.protocols (category_id, code, title, summary, tags, is_published, external_url)
+                    VALUES (%s, %s, %s, %s ,%s, %s, %s)
+                     RETURNING id, category_id, code, title, summary, tags, is_published, created_at, updated_at;
+                    
+        """, (category_id, code, title, summary, tags, is_published, external_url))
         row = cur.fetchone()
-        return _row_to_dict(cur, row) if row else None
+        conn.commit()
+        return row
     finally:
         cur.close()
         conn.close()
 
-def list_protocols(q: Optional[str], category_id: Optional[int],
-                   published: Optional[bool], limit: int, offset: int) -> Tuple[int, List[Dict]]:
+    
+def update_protocol(pid: int, category_id: Optional[int], title: Optional[str], summary: Optional[str],
+                    tags: Optional[list], is_published: Optional[bool], external_url: Optional[str]):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM content.protocols WHERE id=%s", (pid,))
+
+        if not cur.fetchone():
+            raise ValueError("PROTOCOL_NOT_FOUND")
+        
+        cur.execute("""
+            UPDATE content.protocols
+                     title = COALESCE(%s, title),
+                   summary = COALESCE(%s, summary),
+                   tags = COALESCE(%s, tags),
+                   is_published = COALESCE(%s, is_published),
+                   external_url = COALESCE(%s, external_url),
+                   updated_at = NOW()
+             WHERE id = %s
+         RETURNING id, category_id, code, title, summary, tags, is_published, created_at, updated_at;
+        """,(category_id, title, summary, tags, is_published, external_url, pid))
+        row = cur.fetchone()
+        conn.commit()
+        return row
+    finally:
+        cur.close()
+        conn.close()
+
+def get_protocol(pid: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try: 
+        cur.execute("""
+            SELECT id, category_id, code, title, summary, tags, is_published, created_at, updated_at
+              FROM content.protocols WHERE id=%s;
+        """, (pid,))
+        return cur.fetchone()
+    finally: 
+        cur.close()
+        conn.close()
+
+def list_protocols(limit=50, offset=0, q: Optional[str]=None, category_id: Optional[int]=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        where, params = [] , []
+        if q: 
+            where.append("(p.code ILIKE  %s OR p.title ILIKE %s OR P.summary ILIKE %s)")
+            params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+        if category_id is not None:
+            where.append("p.category_id = %s")
+            params.append(category_id)
+        wh = "WHERE" - "AND".join(where) if where else ""
+        cur.execute(f"SELECT COUNT(*) FROM content.protocols p {wh} ;", tuple(params))
+        total = cur.fetchone()[0]
+        cur.execute(f"""
+            SELECT p.id, p.category_id, p.code, p.title, p.summary, p.tags, p.is_published, p.created_at, p.updated_at
+              FROM content.protocols p
+              {wh}
+             ORDER BY p.updated_at DESC
+             LIMIT %s OFFSET %s;
+        """, (*params, limit, offset) if params else (limit, offset))
+        return cur.fetchall(), total
+    finally:
+        cur.close()
+        conn.close()
+
+def update_protocol(protocol_id: int, category_id: Optional[int], title: Optional[str], summary: Optional[str],
+                    tags: Optional[list], is_published: Optional[bool], external_url: Optional[str]):
+    conn = get_db_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM content.protocols WHERE id=%s;", (protocol_id,))
+        if not cur.fetchone():
+            raise ValueError("PROTOCOL_NOT_FOUND")
+        cur.execute("""
+            UPDATE content.protocols
+               SET category_id = COALESCE(%s, category_id),
+                   title = COALESCE(%s, title),
+                   summary = COALESCE(%s, summary),
+                   tags = COALESCE(%s, tags),
+                   is_published = COALESCE(%s, is_published),
+                   external_url = COALESCE(%s, external_url),
+                   updated_at = NOW()
+             WHERE id = %s
+         RETURNING id, category_id, code, title, summary, tags, is_published, created_at, updated_at;
+        """, (category_id, title, summary, tags, is_published, external_url, protocol_id))
+        row = cur.fetchone(); conn.commit()
+        return row
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close()
+        conn.close()
+
+def delete_protocol(protocol_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM content.protocols WHERE id=%s RETURNING id;", (protocol_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("PROTOCOL_NO_FOUND")
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def create_protocol_version(protocol_id: int, body_md: str, changelog: Optional[str], publish: bool):
     conn = get_db_connection(); 
     cur = conn.cursor()
 
     try:
-       where = []
-       params = []
-       if q: 
-        where.append("(title ILIKE %s OR summary ILIKE %s OR search_vector@@ plainto_tsquery('simple', unaccent(%s)))")
-        like = f"%{q.strip()}%"; params += [like, like, like, q]
-        if category_id is not None:
-            where.append("category_id = %s")
-            params.append(category_id)
-        if published is not None:
-            where.append("is_published =%s")
-            params.append(published)
+       
+        cur.execute("SELECT 1 FROM content.protocols WHERE id=%s;", (protocol_id,))
+        if not cur.fetchone():
+            raise ValueError("PROTOCOL_NOT_FOUND")
 
-        where_sql = ("WHERE " + "AND".join(where)) if where else ""
-        cur.execute(f"""
-            SELECT id, code, title, summary, category_id, tags, is_published, created_by, created_at, updated_at
-                    FROM content.protocols
-                    {where_sql}
-                    ORDER BY updated_at DESC
-                    LIMIT %s OFFSET %s;
-        """,(*params, limit, offset))
-        rows = cur.fetchall()
-        items = [_row_to_dict(cur, r) for r in rows]
 
-        cur.execute(f"SELECT COUNT(*) FROM content.protocols {where_sql}", tuple(params))
-        total = cur.fetchone()[0]
-        return total, items
-    finally:
-        cur.close()
-        conn.close()
+        cur.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM content.protocol_versions WHERE protocol_id=%s;", (protocol_id,))
+        next_ver = cur.fetchone()[0]
 
-def insert_protocol(data: Dict) -> Dict:
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
+
         cur.execute("""
-            INSERT INTO content.protocols
-                    (category_id, code, title, summary, tags, is_published, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)  RETURNING  id, code, title, summary, category_id, tags, is_published, created_by, created_at, updated_at;
-        """, (
-             data.get("category_id"), data["code"].strip(), data["title"],
-            data.get("summary"), data.get("tags", []),
-            data.get("is_published", False), data.get("created_by")
-        ))
+            INSERT INTO content.protocol_versions (protocol_id, version, body_md, changelog, published_at)
+            VALUES (%s, %s, %s, %s, CASE WHEN %s THEN NOW() ELSE NULL END)
+            RETURNING id, protocol_id, version, body_md, changelog, published_at, created_at;
+        """, (protocol_id, next_ver, body_md, changelog, publish))
         row = cur.fetchone()
         conn.commit()
-        return _row_to_dict(cur, row)
+        return row
+    except Exception:
+        conn.rollback(); raise
     finally:
-        cur.close()
+        cur.close() 
         conn.close()
 
-def insert_version(protocol_id: int, body_md: str, changelog: Optional[str], publish_now: bool) -> Dict:
+def list_protocol_versions(protocol_id: int) -> List[tuple]:
     conn = get_db_connection()
     cur = conn.cursor()
-    try:
-        cur.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM content.protocol_versions WHERE protocol_id = %s", (protocol_id))
-        next_v = cur.fetchone()
-        cur.execute("""
-            INSERT INTO content.protocol_versions (protocol_id, version , body_md, changelog, published_at) 
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING id, version, body_md, changelog, published_at, created_at; 
-        """,(protocol_id, next_v, body_md, changelog, "NOW()" if publish_now else None))
-        row = cur.fetchone()
-        return _row_to_dict(cur, row)
-    finally:
-        cur.close()
-        conn.close()
-
-def update_protocol(pid: int, data: Dict) -> Optional[Dict]:
-    sets,vals = [], []
-    for k in ("title", "summary","category_id", "tags", "is_published"):
-        if k in data and data[k] is not None:
-            sets.append(f"{k} = %s")
-            vals.append(data[k])
-    if not sets:
-        return get_by_id(pid)
-    vals.append(pid)
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(f"""
-            UPDATE content.protocols
-                    SET {",".join(sets)}
-            WHERE id = %s
-            RETURNING id, code, title, summary, category_id, tags, is_published, created_by, created_at, updated_at;
-        """, tuple(vals))
-        row = cur.fetchone()
-        if not row:
-            conn.rollback()
-            return None
-        conn.commit()
-        return _row_to_dict(cur, row)
-    finally:
-        cur.close()
-        conn.close()
-
-def delete_protocol(pid: int) -> bool : 
-    conn = get_db_connection()
-    cur = conn.cursor()
+    
     try:
         cur.execute("""
-            DELETE FROM content.protocols WHERE id = %s ;
-        """, (pid,))
-        ok = cur.rowcount > 0
-        conn.commit()
-        return ok
+            SELECT id, protocol_id, version, body_md, changelog, published_at, created_at
+            FROM content.protocol_versions
+            WHERE protocol_id=%s
+            ORDER BY version DESC;
+        """, (protocol_id,))
+        return cur.fetchall()
     finally:
         cur.close()
         conn.close()
-
-        

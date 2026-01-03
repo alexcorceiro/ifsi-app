@@ -1,44 +1,51 @@
 from typing import List, Optional, Tuple
 from database.connection import get_db_connection
 
-def list_permissions(limit: int = 100, offset: int = 0, q: Optional[str] = None):
+def list_permissions(limit: int = 100, offset: int = 0, q: Optional[str] = None) -> Tuple[List[tuple], int]:
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        where = "WHERE code ILIKE %s OR label ILIKE %s" if q else ""
-        params = (f"%{q}%", f"%{q}%") if q else ()
+        where = ""
+        params: tuple = ()
+        if q:
+            where = "WHERE p.code ILIKE %s OR p.label ILIKE %s"
+            params = (f"%{q}%", f"%{q}%")
 
-        cur.execute(f"SELECT COUNT(*) FROM permissions {where};", params)
-        total = cur.fetchone()[0]  # <-- le [0] est crucial
+        cur.execute(f"SELECT COUNT(*) FROM public.permissions p {where};", params)
+        total = cur.fetchone()[0]
 
-        cur.execute(f"""
-            SELECT id, code, label, description, created_at, updated_at
-              FROM permissions
+        cur.execute(
+            f"""
+            SELECT p.id, p.code, p.label, p.description, p.created_at, p.updated_at
+              FROM public.permissions p
               {where}
-             ORDER BY code
+             ORDER BY p.code
              LIMIT %s OFFSET %s;
-        """, (*params, limit, offset) if params else (limit, offset))
+            """,
+            (*params, limit, offset) if params else (limit, offset),
+        )
         rows = cur.fetchall()
         return rows, total
     finally:
         cur.close()
         conn.close()
 
-def list_permissions_by_role(role_id:int) -> List[Tuple]:
+def list_permissions_by_role(role_id: int) -> List[Tuple]:
     if not _role_exists(role_id):
         raise ValueError("Role inconnue")
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
-                SELECT p.id, p.code, p.label
-                FROM public.role_permissions rp
-                JOIN public.permissions p ON p.id = rp.permission_id
-                WHERE rp.role_id = %s
-                ORDER BY p.code ASC
-            """, (role_id,))
+            SELECT p.id, p.code, p.label, p.description
+            FROM public.role_permissions rp
+            JOIN public.permissions p ON p.id = rp.permission_id
+            WHERE rp.role_id = %s
+            ORDER BY p.code ASC
+        """, (role_id,))
         return cur.fetchall()
-    finally: 
+    finally:
         cur.close()
         conn.close()
 

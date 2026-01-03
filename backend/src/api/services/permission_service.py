@@ -5,15 +5,21 @@ from api.controller import permission_controller
 def list_permissions(limit: int, offset: int, q: Optional[str]):
     rows, total = permission_controller.list_permissions(limit, offset, q)
     items = [
-        dict(id=r[0], code=r[1], label=r[2], description=r[3],
-             created_at=r[4], updated_at=r[5])
+        dict(
+            id=r[0],
+            code=r[1],
+            label=r[2],
+            description=r[3],
+            created_at=r[4],
+            updated_at=r[5],
+        )
         for r in rows
     ]
     return {
         "items": items,
         "limit": limit,
         "offset": offset,
-        "total": total
+        "total": int(total),
     }
 
 def list_permission_from_role(role_id: int):

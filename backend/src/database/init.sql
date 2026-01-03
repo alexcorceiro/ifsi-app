@@ -5,38 +5,42 @@ BEGIN
   END IF;
 END$$;
 
--- set_updated_at() used by many tables
+
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_proc p
-    JOIN pg_namespace n ON n.oid = p.pronamespace
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE p.proname = 'set_updated_at' AND n.nspname = 'public'
   ) THEN
-    EXECUTE $fn$
-      CREATE FUNCTION public.set_updated_at() RETURNS trigger
-      LANGUAGE plpgsql AS $BODY$
-      BEGIN
-        NEW.updated_at := now();
-        RETURN NEW;
-      END;
-      $BODY$;
-    $fn$;
+    CREATE FUNCTION public.set_updated_at() RETURNS trigger
+    LANGUAGE plpgsql AS $BODY$
+    BEGIN
+      NEW.updated_at := NOW();
+      RETURN NEW;
+    END;
+    $BODY$;
   END IF;
 END$$;
 
+
 -- Schemas
 DO $$
-DECLARE s text;
+DECLARE
+  s text;
 BEGIN
-  FOREACH s IN ARRAY ARRAY['public','content','core','academics','learning','media','comms','news','ai','revision','analytics']
+  FOREACH s IN ARRAY ARRAY[
+    'public','content','core','academics','learning','media',
+    'comms','news','ai','revision','analytics','training' , 'anatomy'
+  ]
   LOOP
     BEGIN
       EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', s);
-    EXCEPTION WHEN invalid_schema_name THEN NULL;
+    EXCEPTION
+      WHEN invalid_schema_name THEN
+        NULL;
     END;
   END LOOP;
-END$$;
+END $$;
 
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
@@ -296,189 +300,432 @@ CREATE TABLE IF NOT EXISTS core.favorites (
 
 CREATE INDEX IF NOT EXISTS idx_fav_user_created ON core.favorites(user_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS core.unit_conversions (
+  id SERIAL PRIMARY KEY,
+  from_unit TEXT NOT NULL,
+  to_unit   TEXT NOT NULL,
+  factor    NUMERIC NOT NULL, -- multiplier from_unit par factor => to_unit
+  UNIQUE(from_unit, to_unit)
+); 
 
-CREATE TABLE IF NOT EXISTS core.dose_calculations (
-    id     SERIAL PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS core.drug_safety_rules (
+  id SERIAL PRIMARY KEY,
+  drug_id INT NOT NULL REFERENCES core.drugs(id) ON DELETE CASCADE,
+  rule_type TEXT NOT NULL CHECK (rule_type IN ('MAX_PER_KG_PER_DAY','MAX_PER_DOSE','MIN_AGE_Y','MAX_AGE_Y')),
+  value NUMERIC NOT NULL,
+  unit  TEXT NULL,
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+  UNIQUE(drug_id, rule_type)
+);
+
+
+CREATE TABLE core.dose_calculations (
+    id        SERIAL PRIMARY KEY,
     user_id   INT REFERENCES public.users(id) ON DELETE SET NULL,
+
+    context   TEXT NOT NULL DEFAULT 'FREE'
+             CHECK (context IN ('FREE','TRAINING_EXERCISE','CLINICAL_CASE')),
+
+    exercise_id INT NULL REFERENCES training.dose_exercises(id) ON DELETE SET NULL,
+    case_id     INT NULL REFERENCES training.clinical_cases(id) ON DELETE SET NULL,
+
     patient_age_y NUMERIC CHECK(patient_age_y IS NULL OR patient_age_y >= 0),
-    weight_kg NUMERIC CHECK(weight_kg IS NULL OR weight_kg > 0),
-    drug_name  TEXT NOT NULL,
-    dose_input JSONB NOT NULL,
-    dose_result  JSONB NOT NULL,
-    notes    TEXT,
+    weight_kg     NUMERIC CHECK(weight_kg IS NULL OR weight_kg > 0),
+
+    drug_name   TEXT NOT NULL,
+    dose_input  JSONB NOT NULL,
+    dose_result JSONB NOT NULL,
+
+    notes      TEXT,
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
     CONSTRAINT chk_drug_name_nonvide CHECK (length(btrim(drug_name)) > 0)
 );
 
-CREATE INDEX IF NOT EXISTS idx_dose_user_created ON core.dose_calculations(user_id,  created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dose_user_created
+  ON core.dose_calculations(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_dose_context
+  ON core.dose_calculations(context);
+
+DROP TRIGGER IF EXISTS trg_dose_calculations_upd ON core.dose_calculations;
+CREATE TRIGGER trg_dose_calculations_upd
+BEFORE UPDATE ON core.dose_calculations
+FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+CREATE TABLE IF NOT EXISTS core.drugs(
+  id     SERIAL PRIMARY KEY,
+  name   TEXT NOT NULL UNIQUE,
+  act_code   TEXT NULL, 
+  default_unit    TEXT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::json,
+  created_at TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS core.drug_presentations(
+  id                  SERIAL PRIMARY KEY,
+  drug_id             INT NOT NULL REFERENCES core.drugs(id) ON DELETE CASCADE,
+  label               TEXT NOT NULL,
+  concentration_value  NUMERIC NULL,
+  concentration_unit   TEXT NULL,
+  volume_ml            NUMERIC NULL,
+  metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(drug_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_drug_presentations_drug
+  ON core.drug_presentations(drug_id);
+
+
+CREATE TABLE IF NOT EXISTS core.units (
+  id SERIAL PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,     -- mg, g, mL, UI, mmol...
+  kind TEXT NOT NULL CHECK (kind IN ('mass','volume','dose','time','rate','other')),
+  to_base_factor NUMERIC,        -- ex: g -> mg = 1000
+  base_code TEXT,                -- mg est la base du 'mass'
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS core.drug_safety_rules (
+  id         SERIAL PRIMARY KEY,
+  drug_id    INT NOT NULL REFERENCES core.drugs(id) ON DELETE CASCADE,
+
+  rule_type  TEXT NOT NULL CHECK (rule_type IN (
+    'MAX_DAILY',        -- dose max/jour
+    'MAX_SINGLE',       -- dose max/prise
+    'MAX_RATE',         -- débit max
+    'MIN_INTERVAL',     -- intervalle min entre prises
+    'MIN_AGE_Y',
+    'MAX_AGE_Y'
+  )),
+
+  value      NUMERIC NOT NULL,
+  unit       TEXT NULL,
+  applies_to JSONB NOT NULL DEFAULT '{}'::jsonb, -- ex: {"age_min_y":0,"age_max_y":12,"weight_min_kg":3}
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(drug_id, rule_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_safety_rules_drug
+  ON core.drug_safety_rules(drug_id);
+
+-- =================== PROGRAMS / COHORTS / ENROLLMENTS ===================
 
 CREATE TABLE IF NOT EXISTS academics.programs (
   id         SERIAL PRIMARY KEY,
-  code       TEXT NOT NULL UNIQUE,     
+  code       TEXT NOT NULL UNIQUE,
   label      TEXT NOT NULL,
   ects_total INT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS academics.cohorts (
-    id    SERIAL PRIMARY KEY,
-    program_id INT NOT NULL REFERENCES academics.programs(id) ON DELETE CASCADE,
-    label   TEXT NOT NULL,
-    year_start INT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (program_id, label)
+  id         SERIAL PRIMARY KEY,
+  program_id INT NOT NULL REFERENCES academics.programs(id) ON DELETE CASCADE,
+  label      TEXT NOT NULL,
+  year_start INT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (program_id, label)
 );
 
 CREATE TABLE IF NOT EXISTS academics.enrollments (
-    id      SERIAL PRIMARY KEY,
-    cohort_id  INT NOT NULL REFERENCES academics.cohorts(id) ON DELETE CASCADE,
-    user_id   INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-    current_year SMALLINT NOT NULL CHECK (current_year BETWEEN 1 AND 3),
-    current_sem SMALLINT CHECK (current_sem BETWEEN 1 AND 6),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (cohort_id, user_id)
+  id           SERIAL PRIMARY KEY,
+  cohort_id    INT NOT NULL REFERENCES academics.cohorts(id) ON DELETE CASCADE,
+  user_id      INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  current_year SMALLINT NOT NULL CHECK (current_year BETWEEN 1 AND 3),
+  current_sem  SMALLINT     CHECK (current_sem  BETWEEN 1 AND 6),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (cohort_id, user_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_enroll_user ON academics.enrollments(user_id);
 
+-- =================== YEARS / SEMESTERS / UE ===================
+
 CREATE TABLE IF NOT EXISTS academics.years (
-  id SERIAL PRIMARY KEY,
+  id         SERIAL PRIMARY KEY,
   program_id INT NOT NULL REFERENCES academics.programs(id) ON DELETE CASCADE,
-  year_no SMALLINT NOT NULL CHECK(year_no BETWEEN 1 AND 3),
-  label TEXT NOT NULL,
-  ects INT,
+  year_no    SMALLINT NOT NULL CHECK(year_no BETWEEN 1 AND 3),
+  label      TEXT NOT NULL,
+  ects       INT,
   UNIQUE(program_id, year_no)
 );
 
-
 CREATE TABLE IF NOT EXISTS academics.semesters (
-    id     SERIAL PRIMARY KEY,
-    program_id  INT NOT NULL REFERENCES academics.programs(id) ON DELETE CASCADE,
-    sem_no SMALLINT NOT NULL CHECK(sem_no BETWEEN 1 AND 6),
-    label TEXT NOT NULL,
-    year_no SMALLINT NOT NULL CHECK(year_no BETWEEN 1 AND 3),
-    UNIQUE (program_id, sem_no)
+  id         SERIAL PRIMARY KEY,
+  program_id INT NOT NULL REFERENCES academics.programs(id) ON DELETE CASCADE,
+  sem_no     SMALLINT NOT NULL CHECK(sem_no BETWEEN 1 AND 6),
+  label      TEXT NOT NULL,
+  year_no    SMALLINT NOT NULL CHECK(year_no BETWEEN 1 AND 3),
+  UNIQUE (program_id, sem_no)
 );
 
-
 CREATE TABLE IF NOT EXISTS academics.ue (
-    id    SERIAL PRIMARY KEY,
-    program_id  INT NOT NULL REFERENCES academics.programs(id)  ON DELETE CASCADE,
-    code   TEXT NOT NULL,
-    title  TEXT NOT NULL,
-    year_no   SMALLINT NOT NULL CHECK(year_no BETWEEN 1 AND 3),
-    sem_no    SMALLINT NOT NULL CHECK(sem_no BETWEEN 1 AND 6),
-    ects    NUMERIC(4,1),
-    description TEXT ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(program_id, code)
+  id          SERIAL PRIMARY KEY,
+  program_id  INT NOT NULL REFERENCES academics.programs(id) ON DELETE CASCADE,
+  code        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  year_no     SMALLINT NOT NULL CHECK(year_no BETWEEN 1 AND 3),
+  sem_no      SMALLINT NOT NULL CHECK(sem_no BETWEEN 1 AND 6),
+  ects        NUMERIC(4,1),
+  description TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(program_id, code)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ue_year_sem ON academics.ue(program_id, year_no, sem_no);
 
+-- =================== COURSES ===================
+
 CREATE TABLE IF NOT EXISTS academics.courses (
-    id     SERIAL PRIMARY KEY,
-    ue_id INT NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
-    code  TEXT,
-    title  TEXT NOT NULL,
-    description TEXT, 
-    order_no  INT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (ue_id, code)
- );
+  id          SERIAL PRIMARY KEY,
+  ue_id       INT  NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
+  code        TEXT NOT NULL,                                 
+  title       TEXT NOT NULL,
+  description TEXT,
+  order_no    INT  NOT NULL DEFAULT 0,
 
- CREATE INDEX IF NOT EXISTS idx_courses_ue ON academics.courses(ue_id);
+  doc_mode TEXT NOT NULL DEFAULT 'CLASSIC'
+    CHECK (doc_mode IN ('CLASSIC','SLIDE','SEMI_MANUAL','MANUAL')),
 
- CREATE TABLE IF NOT EXISTS academics.lessons (
-    id   SERIAL  PRIMARY KEY,
-    course_id INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
-    title   TEXT NOT NULL,
-    objective_md TEXT,
-    content_md  TEXT,
-    order_no  INT NOT NULL DEFAULT 0 ,
-    is_published BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW() 
- );
+  published_version_id INT NULL,
 
- CREATE INDEX IF NOT EXISTS idx_lessons_course ON academics.lessons(course_id);
- DROP TRIGGER IF EXISTS trg_lessons_upd ON academics.lessons;
- CREATE TRIGGER trg_lessons_upd
- BEFORE UPDATE ON academics.lessons
- FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),             
+  UNIQUE (ue_id, code)
+);
 
-CREATE TABLE IF NOT EXISTS academics.lesson_resources (
+CREATE INDEX IF NOT EXISTS idx_courses_ue            ON academics.courses(ue_id);
+CREATE INDEX IF NOT EXISTS idx_courses_updated_at    ON academics.courses(updated_at);
+CREATE INDEX IF NOT EXISTS idx_courses_order_per_ue  ON academics.courses(ue_id, order_no);
+CREATE INDEX IF NOT EXISTS idx_courses_doc_mode       ON academics.courses(doc_mode);
+
+
+DROP TRIGGER IF EXISTS trg_courses_touch_updated_at ON academics.courses;
+CREATE TRIGGER trg_courses_touch_updated_at
+BEFORE UPDATE ON academics.courses
+FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+CREATE TABLE IF NOT EXISTS academics.sources (
+  id       SERIAL PRIMARY KEY,
+  title    TEXT NOT NULL,
+  year     INT,
+ doc_mode    TEXT NOT NULL DEFAULT 'CLASSIC'
+    CHECK (doc_mode IN ('CLASSIC','SLIDE','SEMI_MANUAL','MANUAL')),
+  md5         TEXT UNIQUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE TABLE IF NOT EXISTS academics.source_files (
+  id         SERIAL PRIMARY KEY,
+  source_id  INT NOT NULL
+             REFERENCES academics.sources(id) ON DELETE CASCADE,
+  pdf_data   BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_files_source_id
+  ON academics.source_files(source_id);
+
+CREATE TABLE IF NOT EXISTS academics.source_pages (
+  id         SERIAL PRIMARY KEY,
+  source_id  INT NOT NULL
+             REFERENCES academics.sources(id) ON DELETE CASCADE,
+  page_no    INT NOT NULL CHECK (page_no >= 1),
+  text       TEXT,
+  ocr_text   TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (source_id, page_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_pages_source_page
+  ON academics.source_pages(source_id, page_no);
+
+
+
+CREATE TABLE IF NOT EXISTS academics.page_media_assets (
+  id         SERIAL PRIMARY KEY,
+
+  source_id  INT NOT NULL
+             REFERENCES academics.sources(id) ON DELETE CASCADE,
+
+  page_no    INT NOT NULL CHECK (page_no >= 1),
+
+  kind       TEXT NOT NULL
+             CHECK (kind IN ('figure', 'image', 'manual', 'embedded')),
+
+  mime       TEXT NOT NULL DEFAULT 'image/png',
+
+  data       BYTEA,
+  path       TEXT,
+
+  md5        TEXT NOT NULL,
+
+  bbox       JSONB,
+  width      INT CHECK (width  IS NULL OR width  > 0),
+  height     INT CHECK (height IS NULL OR height > 0),
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_media_storage
+    CHECK (
+      (data IS NOT NULL AND path IS NULL)
+      OR
+      (data IS NULL AND path IS NOT NULL)
+    )
+);
+
+-- Anti-doublons (très utile)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_media_assets_source_md5
+  ON academics.page_media_assets(source_id, md5);
+
+-- Index pour requêtes classiques
+CREATE INDEX IF NOT EXISTS idx_media_assets_source_page
+  ON academics.page_media_assets(source_id, page_no);
+
+CREATE INDEX IF NOT EXISTS idx_media_assets_md5
+  ON academics.page_media_assets(md5);
+
+
+CREATE TABLE IF NOT EXISTS academics.course_versions (
+  id            SERIAL PRIMARY KEY,
+  course_id     INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
+  version_label TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'draft'
+    CHECK(status IN ('draft','published','archived')),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(course_id, version_label)
+);
+
+DROP TRIGGER IF EXISTS trg_course_versions_upd ON academics.course_versions;
+CREATE TRIGGER trg_course_versions_upd
+BEFORE UPDATE ON academics.course_versions
+FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+CREATE TABLE IF NOT EXISTS academics.course_sources (
+  id            SERIAL PRIMARY KEY,
+  course_id     INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
+  version_id    INT NULL REFERENCES academics.course_versions(id) ON DELETE SET NULL,
+  source_id     INT NOT NULL REFERENCES academics.sources(id) ON DELETE CASCADE,
+
+  role          TEXT NOT NULL DEFAULT 'PRIMARY'
+                CHECK (role IN ('PRIMARY','SLIDES','HANDOUT','ANNEX','EXAMS','OTHER')),
+
+  doc_mode      TEXT NOT NULL DEFAULT 'CLASSIC'
+                CHECK (doc_mode IN ('CLASSIC','SLIDE','UNKNOWN')),
+
+  images_policy TEXT NOT NULL DEFAULT 'AUTO'
+                CHECK (images_policy IN ('AUTO','SEMI_MANUAL','PRUDENT')),
+
+  language      TEXT NULL,
+  is_primary    BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE(course_id, source_id, version_id, role)  -- La contrainte UNIQUE corrigée
+);
+
+CREATE INDEX IF NOT EXISTS idx_course_sources_course
+  ON academics.course_sources(course_id);
+
+CREATE INDEX IF NOT EXISTS idx_course_sources_source
+  ON academics.course_sources(source_id);
+
+CREATE INDEX IF NOT EXISTS idx_course_sources_course_version
+  ON academics.course_sources(course_id, version_id);
+
+
+CREATE TABLE IF NOT EXISTS academics.sections (
+  id          SERIAL PRIMARY KEY,
+  course_id   INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
+  version_id  INT NOT NULL REFERENCES academics.course_versions(id) ON DELETE CASCADE,
+  parent_id   INT REFERENCES academics.sections(id) ON DELETE CASCADE,
+  position    INT NOT NULL DEFAULT 0,
+  title       TEXT NOT NULL,
+  content_md  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sections_course_ver ON academics.sections(course_id, version_id);
+CREATE INDEX IF NOT EXISTS idx_sections_parent_pos ON academics.sections(parent_id, position);
+
+DROP TRIGGER IF EXISTS trg_sections_upd ON academics.sections;
+CREATE TRIGGER trg_sections_upd
+BEFORE UPDATE ON academics.sections
+FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+CREATE TABLE IF NOT EXISTS academics.citations (
+  id          SERIAL PRIMARY KEY,
+  section_id  INT NOT NULL REFERENCES academics.sections(id) ON DELETE CASCADE,
+  source_id   INT NOT NULL REFERENCES academics.sources(id) ON DELETE CASCADE,
+  page_start  INT NOT NULL CHECK(page_start >= 1),
+  page_end    INT NOT NULL CHECK(page_end >= page_start),
+  quote       TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_citations_section ON academics.citations(section_id);
+CREATE INDEX IF NOT EXISTS idx_citations_source_pages ON academics.citations(source_id, page_start, page_end);
+
+CREATE TABLE IF NOT EXISTS academics.section_media (
+  id            SERIAL PRIMARY KEY,
+  section_id    INT NOT NULL REFERENCES academics.sections(id) ON DELETE CASCADE,
+  media_asset_id INT NOT NULL REFERENCES academics.page_media_assets(id) ON DELETE CASCADE,
+  position      INT NOT NULL DEFAULT 0,
+  caption       TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(section_id, media_asset_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_section_media_section_pos ON academics.section_media(section_id, position);
+
+-- =================== ANATOMY  ===================
+
+CREATE TABLE IF NOT EXISTS anatomy.nodes (
   id SERIAL PRIMARY KEY,
-  lesson_id INT NOT NULL REFERENCES academics.lessons(id) ON DELETE CASCADE,
-  type TEXT NOT NULL CHECK(type IN ('video','pdf','lien','photo','protocole','quiz')),
-  title TEXT,
-  url TEXT,
-  protocol_id INT REFERENCES content.protocols(id) ON DELETE SET NULL,
-  quiz_id INT,  
-  order_no INT NOT NULL DEFAULT 0,
+  code TEXT UNIQUE,
+  title TEXT NOT NULL,
+  description_md TEXT,
+  node_type TEXT NOT NULL DEFAULT 'STRUCTURE'
+    CHECK (node_type IN ('SYSTEM','REGION','STRUCTURE','FUNCTION','CLINICAL')),
+  tags TEXT[] NOT NULL DEFAULT '{}',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_anatomy_nodes_tags
+  ON anatomy.nodes USING GIN (tags);
 
- CREATE INDEX IF NOT EXISTS idx_lesson_res ON academics.lesson_resources(lesson_id);
-
- CREATE TABLE IF NOT EXISTS academics.competencies (
-    id   SERIAL PRIMARY KEY,
-    code  TEXT NOT NULL UNIQUE,
-    label   TEXT NOT NULL,
-    description TEXT
- );
-
-
-CREATE TABLE IF NOT EXISTS academics.ue_competencies (
-    id   SERIAL  PRIMARY KEY,
-    ue_id  INT NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
-    competency_id INT NOT NULL REFERENCES academics.competencies(id) ON DELETE CASCADE,
-    UNIQUE(ue_id, competency_id)
+CREATE TABLE IF NOT EXISTS anatomy.edges (
+  parent_id INT NOT NULL REFERENCES anatomy.nodes(id) ON DELETE CASCADE,
+  child_id  INT NOT NULL REFERENCES anatomy.nodes(id) ON DELETE CASCADE,
+  relation  TEXT NOT NULL DEFAULT 'PART_OF'
+    CHECK (relation IN ('PART_OF','CONNECTED_TO','SUPPLIES','INNERVATES','DRAINS','RELATED_TO')),
+  PRIMARY KEY(parent_id, child_id, relation)
 );
 
-CREATE TABLE IF NOT EXISTS academics.user_competencies (
-    id    SERIAL PRIMARY KEY, 
-    user_id  INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-    competency_id INT NOT NULL REFERENCES academics.competencies(id) ON DELETE CASCADE,
-    source TEXT NOT NULL CHECK(source IN ('cours', 'stage','examen')),
-    evidence_json JSONB NOT NULL DEFAULT '{}' ::jsonb,
-    validated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (user_id, competency_id, source)
-);
+CREATE INDEX IF NOT EXISTS idx_anatomy_edges_parent ON anatomy.edges(parent_id);
+CREATE INDEX IF NOT EXISTS idx_anatomy_edges_child  ON anatomy.edges(child_id);
 
-CREATE INDEX IF NOT EXISTS idx_user_comp_user ON academics.user_competencies(user_id);
-
-CREATE TABLE IF NOT EXISTS academics.lesson_progress (
+CREATE TABLE IF NOT EXISTS academics.course_anatomy (
   id SERIAL PRIMARY KEY,
-  lesson_id INT NOT NULL REFERENCES academics.lessons(id) ON DELETE CASCADE,
-  user_id INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  status TEXT NOT NULL CHECK (status IN ('non_commence','en_cours','termine','a_revoir')),
-  last_score NUMERIC(5,2),
-  attempts INT NOT NULL DEFAULT 0,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (lesson_id, user_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_lesson_prog_user ON academics.lesson_progress(user_id);
-
-CREATE TABLE IF NOT EXISTS academics.prerequisites (
-    id   SERIAL PRIMARY KEY,
-    ue_id   INT REFERENCES academics.ue(id) ON DELETE CASCADE,
-   requires_ue INT NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
-  UNIQUE (ue_id, requires_ue),
-  CHECK (ue_id <> requires_ue)
-);
-
-CREATE TABLE IF NOT EXISTS academics.ue_completion_rules (
-    id     SERIAL PRIMARY KEY,
-    ue_id   INT NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
-    min_avg  NUMERIC(4, 2),
-    required_competencies INT[] DEFAULT '{}',
-    UNIQUE (ue_id)
+  course_id INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
+  node_id   INT NOT NULL REFERENCES anatomy.nodes(id) ON DELETE CASCADE,
+  importance INT NOT NULL DEFAULT 3 CHECK (importance BETWEEN 1 AND 5),
+  UNIQUE(course_id, node_id)
 );
 
 
+-- =================== LEARNING (types normalisés) ===================
 CREATE TABLE IF NOT EXISTS learning.quizzes (
     id    SERIAL PRIMARY KEY,
     titre   TEXT NOT NULL,
@@ -554,38 +801,266 @@ CREATE TABLE IF NOT EXISTS academics.ue_quizzes (
 
 CREATE INDEX IF NOT EXISTS idx_ue_quizzes_ue ON academics.ue_quizzes(ue_id);
 
-CREATE TABLE IF NOT EXISTS academics.exam_sessions (
-    id SERIAL PRIMARY KEY,
-    ue_id INT REFERENCES academics.ue(id) ON DELETE SET NULL,
-    title  TEXT NOT NULL,
-    exam_type TEXT NOT NULL CHECK (exam_type IN ('blanc', 'reel')),
-    scheduled_at TIMESTAMPTZ,
-    duration_min INT ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS academics.exam_types (
+  code        TEXT PRIMARY KEY,
+  label       TEXT NOT NULL,
+  description TEXT NULL,
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+CREATE TABLE IF NOT EXISTS academics.exam_sessions (
+  id            SERIAL PRIMARY KEY,
+  course_id     INT NOT NULL
+                REFERENCES academics.courses(id)
+                ON DELETE CASCADE,
+
+  title         TEXT NOT NULL,
+  description   TEXT NULL,
+
+  exam_type     TEXT NOT NULL DEFAULT 'EXAM'
+                REFERENCES academics.exam_types(code),
+
+  duration_min  INT NOT NULL CHECK (duration_min > 0),
+
+  max_score     NUMERIC(5,2) NULL,
+  pass_score    NUMERIC(5,2) NULL,
+
+  is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE(course_id, title)
+);
+
+CREATE INDEX IF NOT EXISTS idx_acad_exam_course
+  ON academics.exam_sessions(course_id);
+
+CREATE INDEX IF NOT EXISTS idx_acad_exam_type
+  ON academics.exam_sessions(exam_type);
 
 CREATE TABLE IF NOT EXISTS academics.exam_parts (
   id       SERIAL PRIMARY KEY,
   exam_id  INT NOT NULL REFERENCES academics.exam_sessions(id) ON DELETE CASCADE,
   quiz_id  INT NOT NULL REFERENCES learning.quizzes(id)       ON DELETE CASCADE,
   order_no INT NOT NULL DEFAULT 0,
-  weight   NUMERIC(4,2) NOT NULL DEFAULT 1.0
+  weight   NUMERIC(4,2) NOT NULL DEFAULT 1.0,
+
+  UNIQUE (exam_id, order_no),
+  UNIQUE (exam_id, quiz_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_exam_parts_exam ON academics.exam_parts(exam_id);
+CREATE INDEX IF NOT EXISTS idx_exam_parts_exam
+  ON academics.exam_parts(exam_id);
 
 CREATE TABLE IF NOT EXISTS academics.exam_results (
-    id   SERIAL PRIMARY KEY,
-    exam_id  INT NOT NULL REFERENCES academics.exam_sessions(id) ON DELETE CASCADE,
-    user_id  INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-    score_raw NUMERIC(6,2),
-    score_max NUMERIC(6,2),
-    grade TEXT,
-    computed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (exam_id, user_id)
+  id          SERIAL PRIMARY KEY,
+  exam_id     INT NOT NULL REFERENCES academics.exam_sessions(id) ON DELETE CASCADE,
+  user_id     INT NOT NULL REFERENCES public.users(id)           ON DELETE CASCADE,
+
+  score_raw   NUMERIC(6,2),
+  score_max   NUMERIC(6,2),
+  grade       TEXT,
+
+  computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  UNIQUE (exam_id, user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_exam_results_user ON academics.exam_results(user_id, exam_id);
+CREATE INDEX IF NOT EXISTS idx_exam_results_user
+  ON academics.exam_results(user_id, exam_id);
+
+CREATE TABLE IF NOT EXISTS revision.entity_links (
+  id SERIAL PRIMARY KEY,
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('flashcard','revision_sheet')),
+  entity_id   INT NOT NULL,
+  target_type TEXT NOT NULL CHECK (target_type IN ('course','lesson','ue','section','competency','anatomy_node')),
+  target_id   INT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE(entity_type, entity_id, target_type, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rev_links_target
+  ON revision.entity_links(target_type, target_id);
+
+
+-- =================== REVISION (types normalisés) ===================
+CREATE TABLE IF NOT EXISTS revision.revision_sheets(
+  id     SERIAL PRIMARY KEY,
+  course_id  INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
+  version_id INT NULL REFERENCES academics.course_versions(id) ON DELETE SET NULL,
+
+  title   TEXT NOT NULL,
+   status      TEXT NOT NULL DEFAULT 'DRAFT'
+              CHECK (status IN ('DRAFT','PUBLISHED','ARCHIVED')),
+
+  content_md  TEXT NULL,
+
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_revision_sheets_course
+  ON revision.revision_sheets(course_id, version_id);
+
+CREATE TABLE IF NOT EXISTS revision.revision_sheet_items (
+  id        SERIAL PRIMARY KEY,
+  sheet_id  INT NOT NULL REFERENCES revision.revision_sheets(id) ON DELETE CASCADE,
+
+  item_type TEXT NOT NULL DEFAULT 'BULLET'
+            CHECK (item_type IN ('BULLET','DEFINITION','FORMULA','STEP','WARNING','EXAMPLE','QA')),
+
+  position  INT NOT NULL DEFAULT 1,
+  title     TEXT NULL,
+  body_md   TEXT NOT NULL,
+
+  source_id    INT NULL REFERENCES academics.sources(id) ON DELETE SET NULL,
+  page_start   INT NULL,
+  page_end     INT NULL,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sheet_items_sheet
+  ON revision.revision_sheet_items(sheet_id, position);
+
+
+  CREATE TABLE IF NOT EXISTS revision.srs_schedules (
+  id            SERIAL PRIMARY KEY,
+  user_id       INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  flashcard_id  INT NOT NULL REFERENCES revision.flashcards(id) ON DELETE CASCADE,
+  interval_days INT NOT NULL DEFAULT 1,
+  ease_factor   NUMERIC(4,2) NOT NULL DEFAULT 2.5,
+  repetitions   INT NOT NULL DEFAULT 0,
+  due_at        TIMESTAMPTZ NOT NULL,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, flashcard_id)
+);
+
+CREATE TABLE IF NOT EXISTS revision.srs_reviews (
+  id           SERIAL PRIMARY KEY,
+  user_id      INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  flashcard_id INT NOT NULL REFERENCES revision.flashcards(id) ON DELETE CASCADE,
+  quality      SMALLINT NOT NULL CHECK (quality BETWEEN 0 AND 5),
+  reviewed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  meta         JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_srs_due
+  ON revision.srs_schedules(user_id, due_at);
+
+CREATE INDEX IF NOT EXISTS idx_srs_reviews_user_time
+  ON revision.srs_reviews(user_id, reviewed_at DESC);
+
+-- =================== LESSONS ===================
+
+CREATE TABLE IF NOT EXISTS academics.lessons (
+  id          SERIAL PRIMARY KEY,
+  course_id   INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
+  version_id  INT NULL REFERENCES academics.course_versions(id) ON DELETE SET NULL,
+
+  lesson_type TEXT NOT NULL
+              CHECK (lesson_type IN (
+                'INTRO','CHAPTER','REVISION_SHEET','QUIZ','MOCK_EXAM','EXAM','RESOURCE'
+              )),
+
+  title       TEXT NOT NULL,
+  position    INT  NOT NULL DEFAULT 1,
+
+  content_md  TEXT NULL,
+
+  root_section_id    INT NULL REFERENCES academics.sections(id) ON DELETE SET NULL,
+  quiz_id            INT NULL REFERENCES learning.quizzes(id) ON DELETE SET NULL,
+  exam_id            INT NULL REFERENCES academics.exam_sessions(id) ON DELETE SET NULL,
+  revision_sheet_id  INT NULL REFERENCES revision.revision_sheets(id) ON DELETE SET NULL,
+
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE(course_id, version_id, lesson_type, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lessons_course
+  ON academics.lessons(course_id);
+
+CREATE INDEX IF NOT EXISTS idx_lessons_course_version
+  ON academics.lessons(course_id, version_id);
+
+CREATE INDEX IF NOT EXISTS idx_lessons_type
+  ON academics.lessons(lesson_type);
+
+
+CREATE TABLE IF NOT EXISTS academics.lesson_resources (
+  id         SERIAL PRIMARY KEY,
+  lesson_id  INT  NOT NULL REFERENCES academics.lessons(id) ON DELETE CASCADE,
+  type       TEXT NOT NULL CHECK (type IN ('image','video','pdf','link','article','audio','protocol','quiz')),
+  title      TEXT,
+  url        TEXT,
+  protocol_id INT REFERENCES content.protocols(id) ON DELETE SET NULL,
+  quiz_id     INT,
+  order_no    INT  NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lesson_res ON academics.lesson_resources(lesson_id);
+
+
+ CREATE TABLE IF NOT EXISTS academics.competencies (
+    id   SERIAL PRIMARY KEY,
+    code  TEXT NOT NULL UNIQUE,
+    label   TEXT NOT NULL,
+    description TEXT
+ );
+
+
+CREATE TABLE IF NOT EXISTS academics.ue_competencies (
+    id   SERIAL  PRIMARY KEY,
+    ue_id  INT NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
+    competency_id INT NOT NULL REFERENCES academics.competencies(id) ON DELETE CASCADE,
+    UNIQUE(ue_id, competency_id)
+);
+
+CREATE TABLE IF NOT EXISTS academics.user_competencies (
+    id    SERIAL PRIMARY KEY, 
+    user_id  INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    competency_id INT NOT NULL REFERENCES academics.competencies(id) ON DELETE CASCADE,
+    source TEXT NOT NULL CHECK(source IN ('cours', 'stage','examen')),
+    evidence_json JSONB NOT NULL DEFAULT '{}' ::jsonb,
+    validated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, competency_id, source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_comp_user ON academics.user_competencies(user_id);
+
+CREATE TABLE IF NOT EXISTS academics.lesson_progress (
+  id SERIAL PRIMARY KEY,
+  lesson_id INT NOT NULL REFERENCES academics.lessons(id) ON DELETE CASCADE,
+  user_id INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('non_commence','en_cours','termine','a_revoir')),
+  last_score NUMERIC(5,2),
+  attempts INT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (lesson_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lesson_prog_user ON academics.lesson_progress(user_id);
+
+CREATE TABLE IF NOT EXISTS academics.prerequisites (
+    id   SERIAL PRIMARY KEY,
+    ue_id   INT REFERENCES academics.ue(id) ON DELETE CASCADE,
+   requires_ue INT NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
+  UNIQUE (ue_id, requires_ue),
+  CHECK (ue_id <> requires_ue)
+);
+
+CREATE TABLE IF NOT EXISTS academics.ue_completion_rules (
+    id     SERIAL PRIMARY KEY,
+    ue_id   INT NOT NULL REFERENCES academics.ue(id) ON DELETE CASCADE,
+    min_avg  NUMERIC(4, 2),
+    required_competencies INT[] DEFAULT '{}',
+    UNIQUE (ue_id)
+);
+
 
 CREATE OR REPLACE VIEW academics.v_user_ue_progress AS
 SELECT
@@ -604,59 +1079,178 @@ LEFT JOIN academics.lessons l ON l.course_id = c.id
 LEFT JOIN academics.lesson_progress lp ON lp.lesson_id = l.id AND lp.user_id = u.id
 GROUP BY u.id, ue.id, ue.title;
 
-
-
-CREATE TABLE IF NOT EXISTS media.assets (
-  id          SERIAL PRIMARY KEY,
-  kind        TEXT NOT NULL CHECK (kind IN ('image','video','pdf','audio','other')),
-  storage_key TEXT NOT NULL UNIQUE,
-  mime_type   TEXT NOT NULL,
-  bytes_size  INT CHECK (bytes_size IS NULL OR bytes_size >= 0),
-  width_px    INT CHECK (width_px IS NULL OR width_px > 0),
-  height_px   INT CHECK (height_px IS NULL OR height_px > 0),
-  duration_ms INT CHECK (duration_ms IS NULL OR duration_ms >= 0),
-  alt_text    TEXT,
-  created_by  INT REFERENCES public.users(id) ON DELETE SET NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_assets_kind    ON media.assets(kind);
-CREATE INDEX IF NOT EXISTS idx_assets_created ON media.assets(created_at DESC);
-
-CREATE TABLE IF NOT EXISTS media.asset_variants (
+-- =================== TRAINING (types normalisés) ===================
+CREATE TABLE IF NOT EXISTS training.dose_exercises (
   id           SERIAL PRIMARY KEY,
-  asset_id     INT NOT NULL REFERENCES media.assets(id) ON DELETE CASCADE,
-  variant_key  TEXT NOT NULL,          
-  storage_key  TEXT NOT NULL UNIQUE,
-  mime_type    TEXT NOT NULL,
-  width_px     INT CHECK (width_px IS NULL OR width_px > 0),
-  height_px    INT CHECK (height_px IS NULL OR height_px > 0),
-  bitrate_kbps INT CHECK (bitrate_kbps IS NULL OR bitrate_kbps > 0),
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (asset_id, variant_key)
-);
-CREATE INDEX IF NOT EXISTS idx_asset_variants_asset ON media.asset_variants(asset_id);
+  title        TEXT NOT NULL,
+  statement_md TEXT NOT NULL,
 
-CREATE TABLE IF NOT EXISTS media.entity_assets (
+  exercise_type TEXT NOT NULL DEFAULT 'DOSE_BASIC'
+    CHECK (exercise_type IN (
+      'DOSE_BASIC',        -- ex mg/kg
+      'DILUTION',          -- reconstitution / dilution
+      'INFUSION_RATE',     -- débit ml/h, gouttes/min
+      'CONCENTRATION',     -- mg/ml, UI/ml, etc.
+      'PEDIATRIC',         -- pédiatrie (poids + sécurité)
+      'UNIT_CONVERSION',   -- conversions
+      'MIXED'              -- combo
+    )),
+
+  difficulty   INT NOT NULL DEFAULT 1 CHECK (difficulty BETWEEN 1 AND 10),
+  tags         TEXT[] NOT NULL DEFAULT '{}',
+
+  expected     JSONB NOT NULL DEFAULT '{}'::jsonb,
+  solution_steps JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+  created_by   INT REFERENCES public.users(id) ON DELETE SET NULL,
+  source       TEXT NOT NULL DEFAULT 'TEACHER'
+              CHECK (source IN ('TEACHER','AI','IMPORT')),
+
+  metadata     JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dose_exercises_difficulty
+  ON training.dose_exercises(difficulty);
+
+CREATE INDEX IF NOT EXISTS idx_dose_exercises_type
+  ON training.dose_exercises(exercise_type);
+
+CREATE INDEX IF NOT EXISTS idx_dose_exercises_tags
+  ON training.dose_exercises USING GIN (tags);
+
+CREATE TABLE training.dose_attempts (
+  id            SERIAL PRIMARY KEY,
+  user_id       INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  exercise_id   INT NOT NULL REFERENCES training.dose_exercises(id) ON DELETE CASCADE,
+
+  submitted_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  submitted_value NUMERIC NULL,
+  submitted_unit  TEXT NULL,
+
+  is_correct    BOOLEAN NOT NULL DEFAULT FALSE,
+  score         NUMERIC(5,2) NOT NULL DEFAULT 0,
+  error_codes   TEXT[] NOT NULL DEFAULT '{}'::text[],
+
+  ai_feedback_md TEXT NULL,
+
+  calculation_id INT NULL REFERENCES core.dose_calculations(id) ON DELETE SET NULL,
+
+  time_ms      INT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dose_attempts_user_time
+  ON training.dose_attempts(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_dose_attempts_exercise
+  ON training.dose_attempts(exercise_id);
+
+CREATE TABLE IF NOT EXISTS training.clinical_cases (
   id          SERIAL PRIMARY KEY,
-  entity_type TEXT NOT NULL CHECK (entity_type IN (
-     'category','protocol','protocol_version',
-     'checklist','checklist_run',
-     'dose_calculation',
-     'ue','course','lesson',
-     'quiz','quiz_item',
-     'favorite','user'
-  )),
-  entity_id   INT NOT NULL,
-  asset_id    INT NOT NULL REFERENCES media.assets(id) ON DELETE CASCADE,
-  role        TEXT,           
-  order_no    INT NOT NULL DEFAULT 0,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (entity_type, entity_id, asset_id)
+  title       TEXT NOT NULL,
+  intro_md    TEXT NOT NULL,
+
+  difficulty  INT NOT NULL DEFAULT 1 CHECK (difficulty BETWEEN 1 AND 10),
+  tags        TEXT[] NULL,
+
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_entity_assets_entity ON media.entity_assets(entity_type, entity_id);
-CREATE INDEX IF NOT EXISTS idx_entity_assets_asset  ON media.entity_assets(asset_id);
+CREATE TABLE IF NOT EXISTS training.case_steps (
+  id        SERIAL PRIMARY KEY,
+  case_id   INT NOT NULL REFERENCES training.clinical_cases(id) ON DELETE CASCADE,
+  position  INT NOT NULL DEFAULT 1,
+
+  prompt_md TEXT NOT NULL,
+
+  step_type TEXT NOT NULL DEFAULT 'MCQ'
+            CHECK (step_type IN ('MCQ','FREE','CALC','DECISION')),
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE(case_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_steps_case_pos
+  ON training.case_steps(case_id, position);
+
+CREATE TABLE IF NOT EXISTS training.case_step_choices (
+  id        SERIAL PRIMARY KEY,
+  step_id   INT NOT NULL REFERENCES training.case_steps(id) ON DELETE CASCADE,
+  position  INT NOT NULL DEFAULT 1,
+
+  label     TEXT NOT NULL,
+  is_correct BOOLEAN NOT NULL DEFAULT FALSE,
+  feedback_md TEXT NULL,
+
+  UNIQUE(step_id, position)
+);
+CREATE TABLE IF NOT EXISTS training.case_attempts (
+  id        SERIAL PRIMARY KEY,
+  user_id   INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  case_id   INT NOT NULL REFERENCES training.clinical_cases(id) ON DELETE CASCADE,
+
+  score     NUMERIC NOT NULL DEFAULT 0,
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS training.case_step_answers (
+  id          SERIAL PRIMARY KEY,
+  attempt_id  INT NOT NULL REFERENCES training.case_attempts(id) ON DELETE CASCADE,
+  step_id     INT NOT NULL REFERENCES training.case_steps(id) ON DELETE CASCADE,
+
+  selected_choice_id INT NULL REFERENCES training.case_step_choices(id) ON DELETE SET NULL,
+  free_answer_text   TEXT NULL,
+
+  is_correct BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE(attempt_id, step_id)
+);
+
+CREATE TABLE IF NOT EXISTS training.level_tiers (
+  id        SERIAL PRIMARY KEY,
+  level     INT NOT NULL,
+  tier      INT NOT NULL,
+  xp_min    INT NOT NULL,
+  xp_max    INT NOT NULL,
+
+  unlock_rule JSONB NULL,
+
+  UNIQUE(level, tier),
+  UNIQUE(xp_min, xp_max)
+);
+
+CREATE TABLE IF NOT EXISTS training.dose_exercise_competencies (
+  id            SERIAL PRIMARY KEY,
+  exercise_id   INT NOT NULL REFERENCES training.dose_exercises(id) ON DELETE CASCADE,
+  competency_id INT NOT NULL REFERENCES academics.competencies(id) ON DELETE CASCADE,
+  weight        NUMERIC(4,2) NOT NULL DEFAULT 1.0,
+  UNIQUE(exercise_id, competency_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dose_ex_comp_ex
+  ON training.dose_exercise_competencies(exercise_id);
+
+
+CREATE TABLE training.dose_attempt_feedback (
+  id          SERIAL PRIMARY KEY,
+  attempt_id  INT NOT NULL REFERENCES training.dose_attempts(id) ON DELETE CASCADE,
+  code        TEXT NOT NULL,
+  severity    INT NOT NULL DEFAULT 1 CHECK (severity BETWEEN 1 AND 5),
+  message_md  TEXT NOT NULL,
+  meta        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dose_feedback_attempt
+  ON training.dose_attempt_feedback(attempt_id);
+
+-- =================== COMMUNICATION    ===================
 
 CREATE TABLE IF NOT EXISTS comms.threads (
     id   SERIAL PRIMARY KEY,
@@ -850,6 +1444,17 @@ CREATE TABLE IF NOT EXISTS ai.jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai.jobs(status);
+
+
+CREATE TABLE IF NOT EXISTS ai.tutor_messages (
+  id SERIAL PRIMARY KEY,
+  user_id INT REFERENCES public.users(id) ON DELETE SET NULL,
+  context TEXT NOT NULL CHECK (context IN ('DOSE_TRAINING','DOSE_FREE','COURSE_HELP')),
+  ref_id INT NULL, -- attempt_id ou calculation_id
+  role TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+  content_md TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 CREATE TABLE IF NOT EXISTS revision.notes (
   id            SERIAL PRIMARY KEY,

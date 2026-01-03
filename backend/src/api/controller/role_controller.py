@@ -37,7 +37,7 @@ def get_role_by_id(role_id: int) -> Optional[Tuple]:
             SELECT r.id, r.code, r.label, r.description, r.created_at, r.updated_at
             FROM public.roles AS r
             WHERE r.id = %s
-        """, (role_id,))  # attention à la virgule !
+        """, (role_id,))
         return cur.fetchone()
     finally:
         cur.close()
@@ -139,6 +139,21 @@ def get_permissions_by_role_code(role_code: str) -> List[str]:
             WHERE r.code = %s
             ORDER BY p.code;
         """, (role_code.strip().lower(),))
+        return [row[0] for row in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+def get_roles_codes_by_user_id(user_id: int) -> List[str]:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT r.code  FROM public.user_roles ur 
+                    JOIN public.roles r ON r.id = ur.role_id
+                    WHERE ur.user_id = %s
+                    ORDER BY r.code;
+            """,(user_id,),)
         return [row[0] for row in cur.fetchall()]
     finally:
         cur.close()

@@ -11,13 +11,18 @@ def list_roles(limit: int, offset: int, q: Optional[str]):
 
 def get_role(role_id: int):
     r = role_controller.get_role_by_id(role_id)
-    if not r : raise ValueError("Role introuvable")
-    perms = permission_controller.list_permissions_by_role(role_id)
+    if not r:
+        raise ValueError("Role introuvable")
+    perms = permission_controller.list_permissions_by_role(role_id)  # ← renvoie désormais 4 colonnes
     return {
         "id": r[0], "code": r[1], "label": r[2], "description": r[3],
         "created_at": r[4], "updated_at": r[5],
-        "permissions": [{"id": p[0], "code": p[1], "label": p[2], "description": p[3]} for p in perms]
+        "permissions": [
+            {"id": p[0], "code": p[1], "label": p[2], "description": p[3]}
+            for p in perms
+        ]
     }
+
 
 def create_role(code: str, label: str, description: Optional[str]):
     if role_controller.get_role_by_code(code):

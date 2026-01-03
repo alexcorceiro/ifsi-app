@@ -14,8 +14,15 @@ def get_category(cid: int) -> Dict:
         return ValueError("Categorie introuvable")
     return cat
 
-def list_categories(search: Optional[str], limit: int, offset: int) -> Tuple[int, List[Dict]]:
-    return repo.list_categories(search, limit, offset)
+def list_categories(limit: int, offset: int, q: Optional[str]):
+    rows, total = repo.list_categories(limit, offset, q)
+    items = [
+        {
+            "id": r[0], "code": r[1], "label": r[2], "description": r[3],
+            "created_at": r[4], "updated_at": r[5]
+        } for r in rows
+    ]
+    return {"items": items, "limit": limit, "offset": offset, "total": int(total)}
 
 def update_category(cid: int, payload: CategoryUpdate) -> Dict:
     if payload.model_dump(exclude_unset=True) == {}:

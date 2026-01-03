@@ -59,50 +59,28 @@ def get_category_by_code(code: str) -> Optional[Dict]:
         cur.close()
         conn.close()
 
-def list_category(search: Optional[str], limit: int, offset: int) -> Tuple[int, List[Dict]]:
-    conn = get_db_connection()
-    cur = conn.cursor()
+def list_categories(limit: int = 100, offset: int = 0, q: Optional[str] = None) -> Tuple[List[tuple], int]:
+    conn = get_db_connection(); cur = conn.cursor()
     try:
-        if search:
-            like = f"%{search.strip()}%"
-            cur.execute(
-                """
-                SELECT id, code, label, description, created_at, updated_at
-                FROM content.categories
-                WHERE code ILIKE %s OR label ILIKE %s
-                ORDER BY created_at DESC
-                LIMIT %s OFFSET %s;
-                """,
-                (like, like, limit, offset)
-            )
-            items = cur.fetchall()
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM content.categories
-                WHERE code ILIKE %s OR label ILIKE %s;
-                """,
-                (like, like)
-            )
-        else:
-            cur.execute(
-                """
-                SELECT id, code, label, description, created_at, updated_at
-                FROM content.categories
-                ORDER BY created_at DESC
-                LIMIT %s OFFSET %s;
-                """,
-                (limit, offset)
-            )
-            items = cur.fetchall()
-            cur.execute("SELECT COUNT(*) FROM content.categories;")
+        where, params = "", ()
+        if q:
+            where = "WHERE c.code ILIKE %s OR c.label ILIKE %s"
+            params = (f"%{q}%", f"%{q}%")
+        cur.execute(f"SELECT COUNT(*) FROM content.categories c {where};", params)
         total = cur.fetchone()[0]
-        cols = [d[0] for d in cur.description] if items else \
-               ["id","code","label","description","created_at","updated_at"]
-        return total, [dict(zip(cols, r)) for r in items]
+        cur.execute(f"""
+            SELECT c.id, c.code, c.label, c.description, c.created_at, c.updated_at
+              FROM content.categories c
+              {where}
+             ORDER BY c.code
+             LIMIT %s OFFSET %s;
+        """, (*params, limit, offset) if params else (limit, offset))
+        rows = cur.fetchall()
+        return rows, total
     finally:
         cur.close()
         conn.close()
-
+        
 def update_category(cid: int, data: Dict) -> Optional[Dict]:
     conn = get_db_connection()
     cur = conn.cursor()

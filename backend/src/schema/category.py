@@ -1,25 +1,26 @@
-from typing import Optional, List
-from pydantic import BaseModel, Field
+from datetime import datetime
+from pydantic import BaseModel
+from typing import Optional
 
 class CategoryIn(BaseModel):
-    code: str = Field(..., min_length=1, max_length=120)
-    label: str = Field(..., min_length=1, max_length=120)
-    descritpion: Optional[str] = None
+    code: str
+    label: str
+    description: Optional[str] = None
 
 class CategoryUpdate(BaseModel):
-    label: Optional[str] = Field(None, min_length=1, max_length=200)
+    label: Optional[str] = None
     description: Optional[str] = None
 
 class CategoryOut(BaseModel):
     id: int
     code: str
     label: str
-    description: Optional[str]
-    created_at: str
-    updated_at: str
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
 class CategoryListOut(BaseModel):
-    total: int
-    items: List[CategoryOut]
+    items: list[CategoryOut]
     limit: int
-    affset: int
+    offset: int
+    total: int

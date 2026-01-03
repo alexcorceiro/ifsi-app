@@ -15,11 +15,15 @@ ADMIN_ROLES = ["admin", "permissions_manager"]
     response_model=PermissionListOut,
     dependencies=[Depends(require_any_role(ADMIN_ROLES))],
 )
-def list_permissions(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0), q: Optional[str] = Query(default=None)):
-    try:  
+def list_permissions(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    q: Optional[str] = Query(default=None),
+):
+    try:
         return svc.list_permissions(limit=limit, offset=offset, q=q)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Erreur")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
     
 @router.get("/roles/{role_id}", dependencies=[Depends(require_any_role(ADMIN_ROLES))])
 def list_permissions_of_role(role_id: int):
