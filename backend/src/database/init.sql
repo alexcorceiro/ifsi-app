@@ -390,29 +390,6 @@ CREATE TABLE IF NOT EXISTS core.units (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS core.drug_safety_rules (
-  id         SERIAL PRIMARY KEY,
-  drug_id    INT NOT NULL REFERENCES core.drugs(id) ON DELETE CASCADE,
-
-  rule_type  TEXT NOT NULL CHECK (rule_type IN (
-    'MAX_DAILY',        -- dose max/jour
-    'MAX_SINGLE',       -- dose max/prise
-    'MAX_RATE',         -- débit max
-    'MIN_INTERVAL',     -- intervalle min entre prises
-    'MIN_AGE_Y',
-    'MAX_AGE_Y'
-  )),
-
-  value      NUMERIC NOT NULL,
-  unit       TEXT NULL,
-  applies_to JSONB NOT NULL DEFAULT '{}'::jsonb, -- ex: {"age_min_y":0,"age_max_y":12,"weight_min_kg":3}
-
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(drug_id, rule_type)
-);
-
-CREATE INDEX IF NOT EXISTS idx_safety_rules_drug
-  ON core.drug_safety_rules(drug_id);
 
 -- =================== PROGRAMS / COHORTS / ENROLLMENTS ===================
 
@@ -489,7 +466,7 @@ CREATE TABLE IF NOT EXISTS academics.courses (
   title       TEXT NOT NULL,
   description TEXT,
   order_no    INT  NOT NULL DEFAULT 0,
-
+  description_short TEXT;
   doc_mode TEXT NOT NULL DEFAULT 'CLASSIC'
     CHECK (doc_mode IN ('CLASSIC','SLIDE','SEMI_MANUAL','MANUAL')),
 
@@ -651,6 +628,21 @@ CREATE TABLE IF NOT EXISTS academics.sections (
   position    INT NOT NULL DEFAULT 0,
   title       TEXT NOT NULL,
   content_md  TEXT,
+  section_type TEXT NOT NULL DEFAULT 'CONTENT'
+  CHECK (
+    section_type IN (
+      'INTRO',
+      'CHAPTER',
+      'SUBCHAPTER',
+      'CASE_STUDY',
+      'SUMMARY',
+      'REVISION',
+      'QUIZ'
+    )
+  ),
+  pedagogical_objectives TEXT,
+  estimated_minutes INT,
+  difficulty SMALLINT CHECK (difficulty BETWEEN 1 AND 5);
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -682,6 +674,7 @@ CREATE TABLE IF NOT EXISTS academics.section_media (
   media_asset_id INT NOT NULL REFERENCES academics.page_media_assets(id) ON DELETE CASCADE,
   position      INT NOT NULL DEFAULT 0,
   caption       TEXT,
+  alt_text TEXT,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(section_id, media_asset_id)
 );
@@ -727,22 +720,21 @@ CREATE TABLE IF NOT EXISTS academics.course_anatomy (
 
 -- =================== LEARNING (types normalisés) ===================
 CREATE TABLE IF NOT EXISTS learning.quizzes (
-    id    SERIAL PRIMARY KEY,
-    titre   TEXT NOT NULL,
-    tags    TEXT[] NOT NULL DEFAULT '{}',
-    niveau   TEXT,
-    is_published BOOLEAN NOT NULL DEFAULT FALSE,
-    mode     TEXT CHECK( mode IN ('entrainement', 'examen_blanc', 'diagnostic')) DEFAULT 'entrainement',
-    duration_sec INT CHECK (duration_sec IS NULL OR duration_sec BETWEEN 30 AND 7200),
-    pass_mark  NUMERIC(5, 2),
-    shuffle_items BOOLEAN DEFAULT TRUE,
-    shuffle_options BOOLEAN DEFAULT TRUE,
-    attempts_limit INT ,
- created_by     INT REFERENCES public.users(id) ON DELETE SET NULL,
-  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id              SERIAL PRIMARY KEY,
+    titre           TEXT NOT NULL,
+    tags            TEXT[] NOT NULL DEFAULT '{}',
+    niveau          TEXT,
+    is_published    BOOLEAN NOT NULL DEFAULT FALSE,
+    mode            TEXT CHECK (mode IN ('entrainement', 'examen_blanc', 'diagnostic')) DEFAULT 'entrainement',
+    duration_sec    INT CHECK (duration_sec IS NULL OR duration_sec BETWEEN 30 AND 7200),
+    pass_mark       NUMERIC(5, 2),
+    shuffle_items   BOOLEAN NOT NULL DEFAULT TRUE,
+    shuffle_options BOOLEAN NOT NULL DEFAULT TRUE,
+    attempts_limit  INT,
+    created_by      INT REFERENCES public.users(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
 CREATE INDEX IF NOT EXISTS idx_quizzes_tags ON learning.quizzes USING GIN (tags);
 DROP TRIGGER IF EXISTS trg_quizzes_upd ON learning.quizzes;
 CREATE TRIGGER trg_quizzes_upd BEFORE UPDATE ON learning.quizzes
@@ -886,37 +878,67 @@ CREATE INDEX IF NOT EXISTS idx_rev_links_target
 
 -- =================== REVISION (types normalisés) ===================
 CREATE TABLE IF NOT EXISTS revision.revision_sheets(
-  id     SERIAL PRIMARY KEY,
-  course_id  INT NOT NULL REFERENCES academics.courses(id) ON DELETE CASCADE,
+  id         SERIAL PRIMARY KEY,
+
+  -- ancien (compat) :
+  course_id  INT NULL REFERENCES academics.courses(id) ON DELETE SET NULL,
   version_id INT NULL REFERENCES academics.course_versions(id) ON DELETE SET NULL,
 
-  title   TEXT NOT NULL,
-   status      TEXT NOT NULL DEFAULT 'DRAFT'
-              CHECK (status IN ('DRAFT','PUBLISHED','ARCHIVED')),
+  -- nouveau (générique) :
+  target_type TEXT NULL
+    CHECK (target_type IN ('ue','course','lesson','section','competency','anatomy_node')),
+  target_id   INT NULL,
 
-  content_md  TEXT NULL,
+  title      TEXT NOT NULL,
+  status     TEXT NOT NULL DEFAULT 'DRAFT'
+             CHECK (status IN ('DRAFT','PUBLISHED','ARCHIVED')),
 
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  content_md TEXT NULL,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_revision_sheets_course
+-- index utiles (génériques)
+CREATE INDEX IF NOT EXISTS idx_revision_sheets_target
+  ON revision.revision_sheets(target_type, target_id);
+
+CREATE INDEX IF NOT EXISTS idx_revision_sheets_course_compat
   ON revision.revision_sheets(course_id, version_id);
 
+-- contrainte : au moins une cible (ancien OU nouveau)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_revision_sheet_has_target'
+  ) THEN
+    ALTER TABLE revision.revision_sheets
+    ADD CONSTRAINT chk_revision_sheet_has_target
+    CHECK (
+      (target_type IS NOT NULL AND target_id IS NOT NULL)
+      OR (course_id IS NOT NULL)
+    );
+  END IF;
+END $$;
+
+-- =========================
+-- 2) Sheet Items (texte/sections)
+-- =========================
 CREATE TABLE IF NOT EXISTS revision.revision_sheet_items (
-  id        SERIAL PRIMARY KEY,
-  sheet_id  INT NOT NULL REFERENCES revision.revision_sheets(id) ON DELETE CASCADE,
+  id         SERIAL PRIMARY KEY,
+  sheet_id   INT NOT NULL REFERENCES revision.revision_sheets(id) ON DELETE CASCADE,
 
-  item_type TEXT NOT NULL DEFAULT 'BULLET'
-            CHECK (item_type IN ('BULLET','DEFINITION','FORMULA','STEP','WARNING','EXAMPLE','QA')),
+  item_type  TEXT NOT NULL DEFAULT 'BULLET'
+             CHECK (item_type IN ('BULLET','DEFINITION','FORMULA','STEP','WARNING','EXAMPLE','QA','HEADING','SECTION')),
 
-  position  INT NOT NULL DEFAULT 1,
-  title     TEXT NULL,
-  body_md   TEXT NOT NULL,
+  position   INT NOT NULL DEFAULT 1,
+  title      TEXT NULL,
+  body_md    TEXT NOT NULL,
 
-  source_id    INT NULL REFERENCES academics.sources(id) ON DELETE SET NULL,
-  page_start   INT NULL,
-  page_end     INT NULL,
+  source_id  INT NULL REFERENCES academics.sources(id) ON DELETE SET NULL,
+  page_start INT NULL,
+  page_end   INT NULL,
 
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -924,34 +946,48 @@ CREATE TABLE IF NOT EXISTS revision.revision_sheet_items (
 CREATE INDEX IF NOT EXISTS idx_sheet_items_sheet
   ON revision.revision_sheet_items(sheet_id, position);
 
+-- =========================
+-- 3) Assets (images, etc.) avec position précise
+-- =========================
+CREATE TABLE IF NOT EXISTS revision.sheet_assets (
+  id         SERIAL PRIMARY KEY,
+  sheet_id   INT NOT NULL REFERENCES revision.revision_sheets(id) ON DELETE CASCADE,
 
-  CREATE TABLE IF NOT EXISTS revision.srs_schedules (
-  id            SERIAL PRIMARY KEY,
-  user_id       INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  flashcard_id  INT NOT NULL REFERENCES revision.flashcards(id) ON DELETE CASCADE,
-  interval_days INT NOT NULL DEFAULT 1,
-  ease_factor   NUMERIC(4,2) NOT NULL DEFAULT 2.5,
-  repetitions   INT NOT NULL DEFAULT 0,
-  due_at        TIMESTAMPTZ NOT NULL,
-  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (user_id, flashcard_id)
+  asset_type TEXT NOT NULL
+    CHECK (asset_type IN ('IMAGE')),
+
+  -- Référence fichier (à adapter à ton système média)
+  -- Si tu as déjà une table academics.sources ou media table, on peut référencer:
+  source_id  INT NULL REFERENCES academics.sources(id) ON DELETE SET NULL,
+
+  -- Ou stockage direct (si tu gères des URLs)
+  file_url   TEXT NULL,
+
+  -- Positionnement
+  anchor     TEXT NOT NULL DEFAULT 'PAGE'
+    CHECK (anchor IN ('PAGE','ITEM','ABSOLUTE')),
+
+  anchor_item_id INT NULL REFERENCES revision.revision_sheet_items(id) ON DELETE SET NULL,
+
+  page_no    INT NOT NULL DEFAULT 1,
+  x          NUMERIC(8,2) NOT NULL DEFAULT 0,   -- unités UI (px) ou mm, à standardiser
+  y          NUMERIC(8,2) NOT NULL DEFAULT 0,
+  w          NUMERIC(8,2) NOT NULL DEFAULT 100,
+  h          NUMERIC(8,2) NOT NULL DEFAULT 100,
+  z_index    INT NOT NULL DEFAULT 0,
+
+  caption_md TEXT NULL,
+
+  meta       JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS revision.srs_reviews (
-  id           SERIAL PRIMARY KEY,
-  user_id      INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-  flashcard_id INT NOT NULL REFERENCES revision.flashcards(id) ON DELETE CASCADE,
-  quality      SMALLINT NOT NULL CHECK (quality BETWEEN 0 AND 5),
-  reviewed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  meta         JSONB NOT NULL DEFAULT '{}'::jsonb
-);
+CREATE INDEX IF NOT EXISTS idx_sheet_assets_sheet
+  ON revision.sheet_assets(sheet_id, page_no, z_index);
 
-CREATE INDEX IF NOT EXISTS idx_srs_due
-  ON revision.srs_schedules(user_id, due_at);
-
-CREATE INDEX IF NOT EXISTS idx_srs_reviews_user_time
-  ON revision.srs_reviews(user_id, reviewed_at DESC);
-
+CREATE INDEX IF NOT EXISTS idx_sheet_assets_anchor_item
+  ON revision.sheet_assets(anchor_item_id);
 -- =================== LESSONS ===================
 
 CREATE TABLE IF NOT EXISTS academics.lessons (
@@ -1480,6 +1516,7 @@ CREATE TABLE IF NOT EXISTS revision.flashcards (
   back_md   TEXT NOT NULL,
   tags      TEXT[] NOT NULL DEFAULT '{}',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS revision.srs_schedules (
